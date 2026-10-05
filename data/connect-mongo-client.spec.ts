@@ -1,0 +1,388 @@
+import assert from 'assert';
+import asyncHooks from 'async_hooks';
+import { expect } from 'chai';
+import type { MongoClientOptions } from 'mongodb';
+
+import {
+  connectMongoClientDataService as connectMongoClient,
+  prepareOIDCOptions,
+} from './connect-mongo-client';
+import type { ConnectionOptions } from './connection-options';
+import { mochaTestServer } from '@mongodb-js/compass-test-server';
+import ConnectionString from 'mongodb-connection-string-url';
+
+const defaultOptions = {
+  productDocsLink: 'https://www.mongodb.com/docs/compass/',
+  productName: 'MongoDB Compass',
+};
+
+const setupListeners = () => {
+  //
+};
+
+describe('connectMongoClient', function () {
+  const cluster = mochaTestServer();
+  let clusterConnectionStringURL: ConnectionString;
+
+  before(function () {
+    clusterConnectionStringURL = new ConnectionString(
+      cluster().connectionString
+    );
+  });
+
+  const toBeClosed = new Set<
+    | undefined
+    | { close: () => Promise<void> }
+    | { destroy: () => Promise<void> }
+  >();
+
+  beforeEach(function () {
+    toBeClosed.clear();
+  });
+
+  afterEach(async function () {
+    for (const mongoClientOrTunnel of toBeClosed) {
+      if (mongoClientOrTunnel && 'close' in mongoClientOrTunnel)
+        await mongoClientOrTunnel.close();
+      else await mongoClientOrTunnel?.destroy();
+    }
+  });
+
+  describe('local', function () {
+    it('should return connection config when connected successfully', async function () {
+      const [metadataClient, crudClient, state, { url, options }] =
+        await connectMongoClient({
+          connectionOptions: {
+            connectionString: cluster().connectionString,
+          },
+          setupListeners,
+        });
+
+      for (const closeLater of [metadataClient, crudClient, state]) {
+        toBeClosed.add(closeLater);
+      }
+
+      expect(metadataClient).to.equal(crudClient);
+      expect(url).to.equal(cluster().connectionString);
+
+      expect(options.parentHandle).to.be.a('string');
+      expect(options).to.deep.equal({
+        monitorCommands: true,
+        authMechanismProperties: {},
+        oidc: {
+          allowedFlows: options.oidc?.allowedFlows,
+          signal: undefined,
+        },
+        autoEncryption: undefined,
+        parentHandle: options.parentHandle,
+        applyProxyToOIDC: false,
+        ...defaultOptions,
+      });
+      expect(await (options.oidc?.allowedFlows as any)()).to.deep.equal([
+        'auth-code',
+      ]);
+    });
+
+    it('should return two different clients when AutoEncryption is enabled', async function () {
+      const autoEncryption = {
+        keyVaultNamespace: 'encryption.__keyVault',
+        kmsProviders: {
+          local: { key: Buffer.alloc(96) },
+        },
+        bypassAutoEncryption: true,
+      };
+      const [metadataClient, crudClient, state, { url, options }] =
+        await connectMongoClient({
+          connectionOptions: {
+            connectionString: cluster().connectionString,
+            fleOptions: {
+              storeCredentials: false,
+              autoEncryption,
+            },
+          },
+          setupListeners,
+        });
+
+      for (const closeLater of [metadataClient, crudClient, state]) {
+        toBeClosed.add(closeLater);
+      }
+
+      expect(metadataClient).to.not.equal(crudClient);
+      expect(metadataClient.options.autoEncryption).to.equal(undefined);
+      expect(crudClient.options.autoEncryption).to.be.an('object');
+      expect(url).to.equal(cluster().connectionString);
+
+      expect(options.parentHandle).to.be.a('string');
+      expect(options).to.deep.equal({
+        monitorCommands: true,
+        autoEncryption,
+        authMechanismProperties: {},
+        oidc: {
+          allowedFlows: options.oidc?.allowedFlows,
+          signal: undefined,
+        },
+        parentHandle: options.parentHandle,
+        applyProxyToOIDC: false,
+        ...defaultOptions,
+      });
+      expect(await (options.oidc?.allowedFlows as any)()).to.deep.equal([
+        'auth-code',
+      ]);
+    });
+
+    it('should not override a user-specified directConnection option', async function () {
+      const connectionString = clusterConnectionStringURL.clone();
+      connectionString
+        .typedSearchParams<MongoClientOptions>()
+        .set('directConnection', 'false');
+      const [metadataClient, crudClient, state, { url, options }] =
+        await connectMongoClient({
+          connectionOptions: {
+            connectionString: connectionString.toString(),
+          },
+          setupListeners,
+        });
+
+      for (const closeLater of [metadataClient, crudClient, state]) {
+        toBeClosed.add(closeLater);
+      }
+
+      assert.strictEqual(url, connectionString.toString());
+
+      expect(options.parentHandle).to.be.a('string');
+      expect(options).to.deep.equal({
+        monitorCommands: true,
+        authMechanismProperties: {},
+        oidc: {
+          allowedFlows: options.oidc?.allowedFlows,
+          signal: undefined,
+        },
+        autoEncryption: undefined,
+        parentHandle: options.parentHandle,
+        applyProxyToOIDC: false,
+        ...defaultOptions,
+      });
+      expect(await (options.oidc?.allowedFlows as any)()).to.deep.equal([
+        'auth-code',
+      ]);
+    });
+
+    it('throws network error if loadBalanced is true and there is no server running at the host and port specified', async function () {
+      const error = await connectMongoClient({
+        connectionOptions: {
+          connectionString: 'mongodb://localhost:1/?loadBalanced=true',
+        },
+        setupListeners,
+      }).then(
+        () => null,
+        (err) => err
+      );
+      expect(error).to.have.property('name', 'MongoNetworkError');
+    });
+
+    describe('ssh tunnel failures', function () {
+      // Use async_hooks to track the state of the internal network server used
+      // for SSH tunneling
+      let asyncHook: ReturnType<typeof asyncHooks.createHook>;
+      let resources: Array<{ asyncId: number; type: string; alive: boolean }>;
+
+      beforeEach(function () {
+        resources = [];
+        asyncHook = asyncHooks.createHook({
+          init(asyncId: number, type: string) {
+            resources.push({ asyncId, type, alive: true });
+          },
+          destroy(asyncId: number) {
+            const r = resources.find((r) => r.asyncId === asyncId);
+            if (r) {
+              r.alive = false;
+            }
+          },
+        });
+        asyncHook.enable();
+      });
+
+      afterEach(function () {
+        asyncHook.disable();
+      });
+
+      it('should close ssh tunnel if the connection fails', async function () {
+        const connectionOptions: ConnectionOptions = {
+          connectionString:
+            'mongodb://localhost:27020?serverSelectionTimeoutMS=100',
+          sshTunnel: {
+            host: 'compass-tests.fakehost.localhost',
+            port: 22,
+            username: 'my-user',
+            password: 'password',
+          },
+        };
+
+        const error = await connectMongoClient({
+          connectionOptions,
+          setupListeners,
+        }).catch((err) => err);
+
+        expect(error).to.be.instanceOf(Error);
+
+        // propagates the tunnel error
+        // NOTE: this heavily depends on which server version we're running on
+        const message = error.errors ? error.errors[0].message : error.message;
+        expect(message).to.match(
+          /(All configured authentication methods failed|ENOTFOUND compass-tests\.fakehost\.localhost)|ECONNREFUSED 127.0.0.1:22/
+        );
+
+        for (let i = 0; i < 10; i++) {
+          // Give some time for the server to fully close + relay that status
+          // to the async_hooks tracking
+          await new Promise(setImmediate);
+        }
+        const networkServerStates = resources
+          .filter(({ type }) => type === 'TCPSERVERWRAP')
+          .map(({ alive }) => alive);
+        expect(networkServerStates).to.deep.equal([false]);
+      });
+    });
+  });
+});
+
+// Security-relevant test -- see oidc e2e test for description.
+// eslint-disable-next-line mocha/max-top-level-suites
+describe('prepareOIDCOptions', function () {
+  it('defaults allowedFlows to "auth-code"', async function () {
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+      },
+    });
+
+    expect(await (options.oidc.allowedFlows as any)()).to.deep.equal([
+      'auth-code',
+    ]);
+  });
+
+  it('does not override allowedFlows when set', async function () {
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+        oidc: {
+          allowedFlows: ['auth-code', 'device-auth'],
+        },
+      },
+    });
+    expect(await (options.oidc.allowedFlows as any)()).to.deep.equal([
+      'auth-code',
+      'device-auth',
+    ]);
+  });
+
+  it('maps ALLOWED_HOSTS on the authMechanismProperties (non-url) when enableUntrustedEndpoints is true', function () {
+    function actual(connectionString: string) {
+      return prepareOIDCOptions({
+        connectionOptions: {
+          connectionString,
+          oidc: {
+            enableUntrustedEndpoints: true,
+          },
+        },
+      }).authMechanismProperties;
+    }
+
+    function expected(ALLOWED_HOSTS: string[]) {
+      return { ALLOWED_HOSTS };
+    }
+
+    expect(actual('mongodb://localhost/')).to.deep.equal(
+      expected(['localhost'])
+    );
+    expect(actual('mongodb://localhost:27017/')).to.deep.equal(
+      expected(['localhost'])
+    );
+    expect(actual('mongodb://localhost:12345/')).to.deep.equal(
+      expected(['localhost'])
+    );
+    expect(actual('mongodb://localhost:12345,[::1]/')).to.deep.equal(
+      expected(['localhost', '::1'])
+    );
+    expect(actual('mongodb://localhost,[::1]:999/')).to.deep.equal(
+      expected(['localhost', '::1'])
+    );
+    expect(actual('mongodb://localhost,bar.foo.net/')).to.deep.equal(
+      expected(['localhost', 'bar.foo.net'])
+    );
+    expect(actual('mongodb+srv://bar.foo.net/')).to.deep.equal(
+      expected(['*.foo.net'])
+    );
+    expect(actual('mongodb://127.0.0.1:12345/')).to.deep.equal(
+      expected(['127.0.0.1'])
+    );
+    expect(actual('mongodb://2130706433:12345/')).to.deep.equal(
+      expected(['2130706433'])
+    ); // decimal IPv4
+  });
+
+  it('does not set ALLOWED_HOSTS on the authMechanismProperties (non-url) when enableUntrustedEndpoints is not set', function () {
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+      },
+    });
+
+    expect(options.authMechanismProperties).to.deep.equal({});
+  });
+
+  it('passes through a signal argument', function () {
+    const signal = AbortSignal.abort();
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+      },
+      signal,
+    });
+
+    expect(options.oidc.signal).to.equal(signal);
+  });
+
+  it('sets applyProxyToOIDC to true when shareProxyWithConnection is true', function () {
+    const proxyOptions = { proxy: 'http://proxy.example.com:8080' };
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+        oidc: { shareProxyWithConnection: true },
+      },
+      proxyOptions,
+    });
+    // shareProxyWithConnection === true means "share the connection's proxy
+    // with the IdP": `true` tells devtools-connect to reuse the connection's
+    // proxy agent (options.proxy) for the OIDC fetch.
+    expect(options.applyProxyToOIDC).to.equal(true);
+  });
+
+  it('sets applyProxyToOIDC to proxyOptions when shareProxyWithConnection is not set', function () {
+    const proxyOptions = { proxy: 'http://proxy.example.com:8080' };
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+      },
+      proxyOptions,
+    });
+    // No shareProxyWithConnection corresponds to the checkbox being checked
+    // ("use the app-level proxy for the IdP"): pass the DevtoolsProxyOptions
+    // object so devtools-connect's createFetch routes OIDC HTTP requests
+    // through that proxy.
+    expect(options.applyProxyToOIDC).to.equal(proxyOptions);
+  });
+
+  it('sets applyProxyToOIDC to false when shareProxyWithConnection is not set but no proxy is configured', function () {
+    const options = prepareOIDCOptions({
+      connectionOptions: {
+        connectionString: 'mongodb://localhost:27017',
+      },
+      // proxyOptions defaults to {} (no proxy)
+    });
+    // An empty proxyOptions object is truthy, so it must not be forwarded as
+    // applyProxyToOIDC; otherwise devtools-connect's createFetch would receive
+    // a truthy-but-empty config. Fall back to `false`.
+    expect(options.applyProxyToOIDC).to.equal(false);
+  });
+});
